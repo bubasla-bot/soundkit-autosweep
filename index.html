@@ -86,6 +86,17 @@
     <div class="hint" style="margin-top:6px">Saved automatically on every confirmed hit and kept on this device — paste into Bluefy's GATT write. You never have to note it down.</div>
   </div>
 
+  <div class="panel" id="discoverPanel">
+    <h2>Auto-discover <span id="discSupport" style="color:var(--dim);text-transform:none;letter-spacing:0;font-weight:400"></span></h2>
+    <div class="hint" style="margin-bottom:8px">Finds the receiver by watching for it to power on — no noise from devices already on. Keep the target OFF, tap Listen and let it learn the existing devices, then switch the target ON. The newly-appeared device is flagged and can be set as the target in one tap.</div>
+    <div class="row" style="margin-bottom:10px">
+      <button class="primary" id="listen">Listen for new receivers</button>
+      <button id="stopListen" disabled>Stop</button>
+    </div>
+    <div class="status-line"><span class="dot" id="discDot"></span><span id="discStatus">Idle.</span></div>
+    <div id="discList" style="margin-top:10px"></div>
+  </div>
+
   <div class="panel">
     <h2>1 · Connect</h2>
     <div class="row" style="margin-bottom:10px">
@@ -550,6 +561,68 @@ async function sendSaved(c){
 }
 $('clearSaved').onclick=()=>{ if(confirm('Clear all saved commands on this device?')){ localStorage.removeItem(SAVE_KEY); renderSaved(); } };
 window.addEventListener('load', renderSaved);
+
+// ---- AUTO-DISCOVER: identify a receiver by watching for it to power ON ----
+// Baselines the devices already advertising, then flags any device that appears
+// AFTER the baseline — that's the one the operator just switched on. Eliminates
+// the noise of already-on receivers. Requires the Web Bluetooth Scanning API
+// (navigator.bluetooth.requestLEScan): desktop/Android Chrome behind
+// chrome://flags/#enable-experimental-web-platform-features. Bluefy/iOS + Safari
+// do NOT support it — the tool detects that and shows the picker fallback.
+let leScan=null, discBaseline=new Set(), discovering=false, baselineDone=false, discSeen=new Map();
+function setDisc(t,s){ $('discStatus').textContent=t; $('discDot').className='dot'+(s?' '+s:''); }
+const discSupported=()=> !!(navigator.bluetooth && navigator.bluetooth.requestLEScan);
+(function(){ const el=$('discSupport'); if(el) el.textContent = discSupported() ? '· scanning API available' : '· not supported in this browser'; })();
+
+async function startListen(){
+  if(!discSupported()){
+    setDisc("This browser has no Web Bluetooth Scanning API (requestLEScan), so passive auto-discovery isn't possible here — Bluefy/iOS and Safari don't support it; desktop/Android Chrome needs chrome://flags → \"Experimental Web Platform features\". FALLBACK: keep the target OFF, tap Scan below and note the devices in the picker, then power the target ON — the newly-appeared device is yours.",'err');
+    log('auto-discover unavailable: requestLEScan not implemented in this browser','er');
+    return;
+  }
+  try{
+    discBaseline=new Set(); discSeen=new Map(); baselineDone=false; discovering=true;
+    $('listen').disabled=true; $('stopListen').disabled=false; $('discList').innerHTML='';
+    setDisc('Learning existing devices — keep the target OFF for a few seconds…','busy');
+    navigator.bluetooth.addEventListener('advertisementreceived', onAdv);
+    leScan=await navigator.bluetooth.requestLEScan({acceptAllAdvertisements:true});
+    setTimeout(()=>{ if(!discovering) return; baselineDone=true;
+      setDisc('Baseline set ('+discBaseline.size+' existing device(s)). NOW switch the receiver ON — new arrivals get flagged.','ok'); renderDisc();
+    }, 6000);
+  }catch(e){ discovering=false; $('listen').disabled=false; $('stopListen').disabled=true; setDisc('Scan failed: '+formatError(e).pretty,'err'); }
+}
+function onAdv(e){
+  const id=e.device.id, name=e.device.name||e.name||'(unnamed)', rssi=(typeof e.rssi==='number')?e.rssi:null;
+  if(!baselineDone){ discBaseline.add(id); }
+  const isNew=baselineDone && !discBaseline.has(id);
+  const prev=discSeen.get(id);
+  discSeen.set(id,{id,name,rssi,isNew,device:e.device,count:prev?prev.count+1:1});
+  if(isNew && (!prev||!prev.isNew)){ setDisc('★ NEW receiver: '+name+(rssi!=null?' (rssi '+rssi+')':''),'ok'); log('NEW device appeared: '+name+' / '+id,'rx'); }
+  renderDisc();
+}
+function renderDisc(){
+  const list=[...discSeen.values()].sort((a,b)=>(b.isNew-a.isNew)||((b.rssi||-999)-(a.rssi||-999)));
+  $('discList').innerHTML = list.map(d=>`<div style="border:1px solid ${d.isNew?'#1c4a30':'var(--line)'};background:${d.isNew?'#0d2417':'transparent'};border-radius:8px;padding:9px;margin-bottom:6px">
+    <div style="color:${d.isNew?'var(--live)':'var(--dim)'};font-weight:${d.isNew?'600':'400'}">${d.isNew?'★ NEW · ':''}${d.name}</div>
+    <div style="font-size:11px;color:var(--dim)">${d.rssi!=null?'rssi '+d.rssi+' · ':''}seen ${d.count}× · id ${String(d.id).slice(0,14)}…</div>
+    ${d.isNew?`<div class="row" style="margin-top:6px"><button class="primary" data-use="${d.id}">Use as target</button></div>`:''}
+  </div>`).join('') || '<div class="hint">No advertisements yet…</div>';
+  $('discList').querySelectorAll('button[data-use]').forEach(b=>b.onclick=()=>useDiscovered(b.dataset.use));
+}
+async function useDiscovered(id){
+  const d=discSeen.get(id); if(!d) return;
+  stopListen(); setDisc('Selected '+d.name+' as target.','ok');
+  device=d.device;
+  try{ device.addEventListener('gattserverdisconnected',onDisconnected); }catch(e){}
+  showDevBox(); $('scan').textContent='Re-scan';
+  setConnStatus('Target set from auto-discover: '+d.name+' — connecting…','busy');
+  log('using discovered device: '+d.name,'pr');
+  try{ await doConnect(); }
+  catch(e){ setConnStatus('Auto-connect failed ('+formatError(e).pretty+'). Press Scan and pick "'+d.name+'" from the list.','err'); }
+}
+function stopListen(){ discovering=false; try{ if(leScan) leScan.stop(); }catch(e){} try{ navigator.bluetooth.removeEventListener('advertisementreceived',onAdv); }catch(e){} $('listen').disabled=false; $('stopListen').disabled=true; }
+$('listen').onclick=startListen;
+$('stopListen').onclick=()=>{ stopListen(); setDisc('Stopped.',''); };
 
 function renderResults(){
   const w=$('resultsWrap');
