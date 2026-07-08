@@ -175,12 +175,33 @@ function formatError(e){
 }
 
 (function(){ const w=$('support');
-  if(navigator.bluetooth){ w.textContent='Web Bluetooth available. If Scan does nothing, this is running inside a sandbox — open the file on HTTPS (GitHub Pages) in Chrome/Android or desktop. iPhone: use the Bluefy browser.'; }
+  if(navigator.bluetooth){
+    w.textContent='Web Bluetooth available. If Scan does nothing, this is running inside a sandbox — open the file on HTTPS (GitHub Pages) in Chrome/Android or desktop. iPhone: use the Bluefy browser.';
+    checkAdapterAvailability();
+  }
   else{ w.textContent='Web Bluetooth NOT available. Use Chrome on Android/desktop, or Bluefy on iOS. Safari and iOS Chrome will not work.'; $('scan').disabled=true; }
 })();
 
+// Bluefy (and some other stacks) can report "no adapter" for a beat after the page
+// loads, before iOS finishes handing CoreBluetooth control to the WebView. This does
+// a non-blocking pre-check and logs it, purely informational — requestDevice() itself
+// is still what actually surfaces a real failure, this just gives an early heads-up.
+async function checkAdapterAvailability(){
+  if(!navigator.bluetooth.getAvailability) return; // not supported everywhere; fine to skip
+  try{
+    const avail=await navigator.bluetooth.getAvailability();
+    if(!avail){
+      setConnStatus('No Bluetooth adapter detected yet. On iPhone/Bluefy: check iOS Settings → Bluetooth is ON and Settings → Bluefy → Bluetooth permission is allowed, then retry Scan.','err');
+      log('getAvailability() = false at page load — adapter not ready or permission not granted','er');
+    }else{
+      log('getAvailability() = true — adapter ready','pr');
+    }
+  }catch(e){ log('getAvailability() check failed: '+formatError(e),'pr'); }
+}
+
 // ---- STEP 1: SCAN — open the native device picker, let the operator pick the receiver ----
-async function doScan(){
+async function doScan(retryCount){
+  retryCount = retryCount || 0;
   if(!navigator.bluetooth){
     setConnStatus('Web Bluetooth is not available in this browser/context (needs HTTPS + Chrome/Bluefy).','err');
     log('scan aborted: navigator.bluetooth is undefined — wrong browser or not a secure context','er');
@@ -203,8 +224,31 @@ async function doScan(){
     await doConnect();
   }catch(e){
     const msg=formatError(e);
-    setConnStatus('Scan cancelled: '+msg,'err');
-    log('scan cancelled/failed: '+msg,'er');
+    // Bluefy on iOS sometimes reports "adapter not available" for the first attempt
+    // right after launch/page-load, before CoreBluetooth has actually spun up — even
+    // with Bluetooth on and permission granted. A single automatic retry after a short
+    // delay resolves this most of the time without making the operator hunt for a button.
+    // IMPORTANT: only match the adapter-unavailable text specifically — NotFoundError is
+    // also what Chrome throws when the user deliberately cancels the picker dialog, and
+    // we must never auto-reopen the picker in that case.
+    const looksLikeColdAdapter = /adapter not available/i.test(msg);
+    const userCancelled = /user cancelled/i.test(msg);
+    if(looksLikeColdAdapter && retryCount < 2){
+      setConnStatus('Adapter not ready yet — retrying in 2s… (attempt '+(retryCount+2)+'/3)','busy');
+      log('scan failed ('+msg+') — auto-retrying, this is common on first launch in Bluefy','er');
+      setTimeout(()=>doScan(retryCount+1), 2000);
+      return;
+    }
+    if(looksLikeColdAdapter){
+      setConnStatus('Bluetooth adapter still not available after retries. On iPhone/Bluefy: confirm iOS Settings → Bluetooth is ON, Settings → Bluefy → Bluetooth is allowed, then fully quit and reopen Bluefy (not just reload the page) and try again.','err');
+      log('scan cancelled/failed after '+(retryCount+1)+' attempts: '+msg,'er');
+    }else if(userCancelled){
+      setConnStatus('Picker closed — no device selected. Press Scan to try again.','');
+      log('picker cancelled by user','pr');
+    }else{
+      setConnStatus('Scan cancelled: '+msg,'err');
+      log('scan cancelled/failed: '+msg,'er');
+    }
     $('scan').disabled=false;
   }
 }
