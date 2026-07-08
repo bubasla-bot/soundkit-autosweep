@@ -133,16 +133,21 @@
 
 <script>
 // ---- candidate services (Web Bluetooth can't wildcard; probe vendor range + UART) ----
+// IMPORTANT: use canonical lowercase 128-bit UUID STRINGS, never 16-bit integer
+// shorthand. Desktop Chrome accepts integers like 0xFF00, but thin iOS WebBluetooth
+// bridges (Bluefy / WebBLE) reject an integer optionalServices entry with an opaque
+// numeric error BEFORE the picker ever opens. The earlier "full list vs minimal list"
+// A/B test never caught this because BOTH lists were integer-based — the real untested
+// variable was the UUID *format*. Expanding 0xNNNN -> "0000nnnn-0000-1000-8000-00805f9b34fb"
+// is spec-compliant and works identically on Chrome and Bluefy.
+const uuid16 = n => '0000' + n.toString(16).padStart(4,'0') + '-0000-1000-8000-00805f9b34fb';
+const UART = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const CANDIDATES=[];
-for(let i=0xFF00;i<=0xFFFF;i++) CANDIDATES.push(i);
-CANDIDATES.push('6e400001-b5a3-f393-e0a9-e50e24dcca9e',0x1800,0x1801,0x180a,0x180f);
-// A trimmed fallback list — some thin WebView Bluetooth bridges (observed: Bluefy)
-// have been seen to reject requestDevice() with an opaque, undocumented internal
-// error when optionalServices is very large (our full vendor sweep is ~261 UUIDs).
-// This isn't documented anywhere, so we treat it as a testable hypothesis rather than
-// a fact: if the full list fails, we automatically retry once with a much smaller
-// list and report explicitly whether that changed the outcome.
-const CANDIDATES_MINIMAL=['6e400001-b5a3-f393-e0a9-e50e24dcca9e',0x1800,0x1801,0x180a,0x180f,0xFF00,0xFFE0,0xFFE1];
+for(let i=0xFF00;i<=0xFFFF;i++) CANDIDATES.push(uuid16(i));      // vendor range FF00–FFFF
+CANDIDATES.push(UART, uuid16(0x1800), uuid16(0x1801), uuid16(0x180a), uuid16(0x180f));
+// A trimmed fallback list. If the full ~261-entry list fails on a bridge with a
+// size limit, we auto-retry once with this and report whether it changed the outcome.
+const CANDIDATES_MINIMAL=[UART, uuid16(0x1800), uuid16(0x1801), uuid16(0x180a), uuid16(0x180f), uuid16(0xFF00), uuid16(0xFFE0), uuid16(0xFFE1)];
 
 // ---- candidate payloads: four-state hypothesis + ASCII variants ----
 const PAYLOADS=[
@@ -292,8 +297,8 @@ async function doScan(retryCount, useMinimalServices){
       setConnStatus('Bluetooth adapter still not available after retry. On iPhone/Bluefy: confirm iOS Settings → Bluetooth is ON, Settings → Bluefy → Bluetooth is allowed, then fully quit and reopen Bluefy (not just reload the page) and try again.','err');
       log('scan cancelled/failed after '+(retryCount+1)+' attempts: '+msg,'er');
     }else if(looksLikeUndocumentedCode && useMinimalServices){
-      setConnStatus("Scan STILL fails with a MINIMAL optionalServices list too — so list size is ruled out as the cause. This is a genuine undocumented Bluefy bridge error. See the \"raw error shape\" line in the Log panel and share it along with your Bluefy app version.",'err');
-      log('scan failed even with MINIMAL service list — list-size hypothesis disproven. Raw code: '+msg,'er');
+      setConnStatus("Scan STILL fails with a MINIMAL list of canonical string UUIDs — so both list size AND integer-vs-string UUID format are now ruled out. This points to a genuine Bluefy/iOS issue (permission, app trial limit, or a Bluefy bug). See the \"raw error shape\" line in the Log and share it with your Bluefy version + iOS version.",'err');
+      log('scan failed even with MINIMAL string-UUID list — list-size AND UUID-format hypotheses both disproven. Raw code: '+msg,'er');
     }else if(userCancelled){
       setConnStatus('Picker closed — no device selected. Press Scan to try again.','');
       log('picker cancelled by user','pr');
