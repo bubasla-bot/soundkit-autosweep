@@ -165,32 +165,40 @@ function setConnStatus(txt,state){ $('connStatusText').textContent=txt; const d=
 // implementations reject with a bare object, a string, or nothing at all. Never trust
 // e.message directly or you get the literal text "undefined" on screen.
 //
-// Bluefy specifically has been observed rejecting requestDevice() with a BARE NUMBER
-// that looks like a raw CoreBluetooth CBManagerState enum value leaking through its
-// native bridge instead of a proper error message:
-//   0 unknown | 1 resetting | 2 unsupported | 3 unauthorized | 4 poweredOff | 5 poweredOn
-// We can't be 100% certain that's what a given number means (Bluefy doesn't document
-// this), so we show the raw code AND the most likely CBManagerState interpretation.
-const CBMANAGERSTATE_GUESS = {
-  0:'unknown — Bluetooth state not yet determined, try again in a second',
-  1:'resetting — Bluetooth stack is restarting, try again shortly',
-  2:'unsupported — this device/app reports BLE central role as unsupported',
-  3:'unauthorized — Bluefy does not have Bluetooth permission. Check iOS Settings → Bluefy → Bluetooth',
-  4:'poweredOff — Bluetooth is turned off. Check iOS Settings → Bluetooth is ON (and Control Center toggle)',
-  5:'poweredOn — adapter is fine; this code should not normally cause a failure'
-};
+// NOTE ON BLUEFY: Bluefy has been observed rejecting requestDevice() with a bare
+// number (seen: 2). An earlier version of this code guessed that was a leaked
+// CoreBluetooth CBManagerState enum value — but that guess doesn't hold up: we've
+// also seen getAvailability()===true (adapter ready) immediately before the same
+// numeric "2" failure, and CBManagerState.unsupported/poweredOff would not coexist
+// with getAvailability()===true. So the number is something else — likely a
+// Bluefy-internal error code with no public documentation. Rather than keep guessing,
+// we now capture and surface the RAW error shape (own properties + prototype name +
+// toString) so the actual cause can be identified from real evidence.
+function dumpErrorShape(e){
+  const info={ typeofE: typeof e, value: null, ownProps: {}, protoName: null, toStringResult: null };
+  try{ info.value = (typeof e==='object') ? '[object]' : String(e); }catch(_e){}
+  try{
+    if(e && typeof e==='object'){
+      Object.getOwnPropertyNames(e).forEach(k=>{ try{ info.ownProps[k]=String(e[k]); }catch(_e){ info.ownProps[k]='<unreadable>'; } });
+      info.protoName = e.constructor ? e.constructor.name : null;
+    }
+  }catch(_e){}
+  try{ info.toStringResult = String(e); }catch(_e){}
+  return info;
+}
 function formatError(e){
+  const shape=dumpErrorShape(e);
+  log('raw error shape: '+JSON.stringify(shape),'er');
   if(e===undefined||e===null) return 'no error details returned (e is '+e+')';
   if(typeof e==='number'){
-    const guess=CBMANAGERSTATE_GUESS[e];
-    return 'raw code '+e+(guess?' — likely CoreBluetooth state: '+guess:' (unrecognized numeric code, see Bluefy/OS Bluetooth settings)');
+    return 'raw numeric code '+e+' from the browser bridge (undocumented — see "raw error shape" line above in the log for full diagnostic detail; not a confirmed CoreBluetooth state, do not assume unsupported/unauthorized/poweredOff from this alone)';
   }
   if(typeof e==='string') return e;
   if(e && typeof e.message==='string' && e.message.length) return e.message+(e.name?' ('+e.name+')':'');
   if(e && typeof e.name==='string' && e.name.length) return e.name;
   try{ const s=JSON.stringify(e); if(s && s!=='{}') return s; }catch(_e){}
   try{ const s=String(e); if(s && s!=='[object Object]' && s!=='undefined') return s; }catch(_e){}
-  return 'unknown error (no message/name — see console)';
+  return 'unknown error (no message/name — see "raw error shape" line above in the log)';
 }
 
 (function(){ const w=$('support');
@@ -250,24 +258,24 @@ async function doScan(retryCount){
     // IMPORTANT: only match the adapter-unavailable text specifically — NotFoundError is
     // also what Chrome throws when the user deliberately cancels the picker dialog, and
     // we must never auto-reopen the picker in that case.
-    // Numeric CBManagerState codes: 0 unknown, 1 resetting are transient — worth retrying.
-    // 2 unsupported, 3 unauthorized, 4 poweredOff are NOT going to fix themselves on retry —
-    // those need a real settings change from the operator, so don't loop on them.
-    const looksLikeColdAdapter = /adapter not available/i.test(msg) || /raw code (0|1) —/.test(msg);
-    const looksLikeSettingsIssue = /raw code (2|3|4) —/.test(msg);
+    // Bluefy's bare numeric codes are undocumented (see formatError/dumpErrorShape) — we
+    // no longer assume what they mean. Retry once in case it's transient, then surface
+    // the raw diagnostic evidence (logged by formatError) instead of guessing further.
+    const looksLikeColdAdapter = /adapter not available/i.test(msg);
+    const looksLikeUndocumentedCode = /raw numeric code/i.test(msg);
     const userCancelled = /user cancelled/i.test(msg);
-    if(looksLikeColdAdapter && retryCount < 2){
-      setConnStatus('Adapter not ready yet — retrying in 2s… (attempt '+(retryCount+2)+'/3)','busy');
-      log('scan failed ('+msg+') — auto-retrying, this is common on first launch in Bluefy','er');
+    if((looksLikeColdAdapter || looksLikeUndocumentedCode) && retryCount < 1){
+      setConnStatus('Scan failed — retrying once in 2s in case it was transient…','busy');
+      log('scan failed ('+msg+') — auto-retrying once','er');
       setTimeout(()=>doScan(retryCount+1), 2000);
       return;
     }
     if(looksLikeColdAdapter){
-      setConnStatus('Bluetooth adapter still not available after retries. On iPhone/Bluefy: confirm iOS Settings → Bluetooth is ON, Settings → Bluefy → Bluetooth is allowed, then fully quit and reopen Bluefy (not just reload the page) and try again.','err');
+      setConnStatus('Bluetooth adapter still not available after retry. On iPhone/Bluefy: confirm iOS Settings → Bluetooth is ON, Settings → Bluefy → Bluetooth is allowed, then fully quit and reopen Bluefy (not just reload the page) and try again.','err');
       log('scan cancelled/failed after '+(retryCount+1)+' attempts: '+msg,'er');
-    }else if(looksLikeSettingsIssue){
-      setConnStatus('Bluetooth blocked: '+msg,'err');
-      log('scan failed — settings-level block, retrying will not help: '+msg,'er');
+    }else if(looksLikeUndocumentedCode){
+      setConnStatus("Scan failed with an undocumented Bluefy error code after retry. See the \"raw error shape\" line in the Log panel below and share it — that has the real diagnostic detail this message alone can't give you.",'err');
+      log('scan cancelled/failed after '+(retryCount+1)+' attempts, undocumented code: '+msg,'er');
     }else if(userCancelled){
       setConnStatus('Picker closed — no device selected. Press Scan to try again.','');
       log('picker cancelled by user','pr');
