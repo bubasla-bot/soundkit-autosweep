@@ -161,6 +161,19 @@ function hex2bytes(h){ const a=new Uint8Array(h.length/2); for(let i=0;i<a.lengt
 function setStatus(txt,state){ $('statusText').textContent=txt; const d=$('dot'); d.className='dot'+(state?' '+state:''); }
 function setConnStatus(txt,state){ $('connStatusText').textContent=txt; const d=$('connDot'); d.className='dot'+(state?' '+state:''); }
 
+// Not every rejection is a real Error/DOMException — some embedded WebViews / stub
+// implementations reject with a bare object, a string, or nothing at all. Never trust
+// e.message directly or you get the literal text "undefined" on screen.
+function formatError(e){
+  if(e===undefined||e===null) return 'no error details returned (e is '+e+')';
+  if(typeof e==='string') return e;
+  if(e && typeof e.message==='string' && e.message.length) return e.message+(e.name?' ('+e.name+')':'');
+  if(e && typeof e.name==='string' && e.name.length) return e.name;
+  try{ const s=JSON.stringify(e); if(s && s!=='{}') return s; }catch(_e){}
+  try{ const s=String(e); if(s && s!=='[object Object]' && s!=='undefined') return s; }catch(_e){}
+  return 'unknown error (no message/name — see console)';
+}
+
 (function(){ const w=$('support');
   if(navigator.bluetooth){ w.textContent='Web Bluetooth available. If Scan does nothing, this is running inside a sandbox — open the file on HTTPS (GitHub Pages) in Chrome/Android or desktop. iPhone: use the Bluefy browser.'; }
   else{ w.textContent='Web Bluetooth NOT available. Use Chrome on Android/desktop, or Bluefy on iOS. Safari and iOS Chrome will not work.'; $('scan').disabled=true; }
@@ -168,27 +181,48 @@ function setConnStatus(txt,state){ $('connStatusText').textContent=txt; const d=
 
 // ---- STEP 1: SCAN — open the native device picker, let the operator pick the receiver ----
 async function doScan(){
+  if(!navigator.bluetooth){
+    setConnStatus('Web Bluetooth is not available in this browser/context (needs HTTPS + Chrome/Bluefy).','err');
+    log('scan aborted: navigator.bluetooth is undefined — wrong browser or not a secure context','er');
+    return;
+  }
   try{
     setConnStatus('Opening device picker…','busy');
     $('scan').disabled=true;
     const picked=await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices:CANDIDATES});
+    if(!picked){
+      setConnStatus('No device returned by picker.','err');
+      log('requestDevice resolved with no device','er');
+      $('scan').disabled=false;
+      return;
+    }
     device=picked;
     device.addEventListener('gattserverdisconnected',onDisconnected);
-    log('selected device: '+(device.name||device.id),'pr');
+    log('selected device: '+(device.name||device.id||'(unnamed)'),'pr');
     showDevBox();
     await doConnect();
   }catch(e){
-    setConnStatus('Scan cancelled: '+e.message,'err');
-    log('scan cancelled/failed: '+e.message,'er');
+    const msg=formatError(e);
+    setConnStatus('Scan cancelled: '+msg,'err');
+    log('scan cancelled/failed: '+msg,'er');
     $('scan').disabled=false;
   }
 }
 
 // ---- STEP 2: CONNECT — establish the GATT link to the picked/known device ----
 async function doConnect(){
+  if(!device || !device.gatt){
+    setConnStatus('No device/GATT server available to connect to.','err');
+    log('connect aborted: device or device.gatt is undefined','er');
+    $('scan').disabled=false;
+    return;
+  }
   try{
     setConnStatus('Connecting to '+(device.name||'device')+'…','busy');
     server=await device.gatt.connect();
+    if(!server){
+      throw new Error('gatt.connect() resolved with no server object');
+    }
     connected=true;
     setConnStatus('Connected — ready to sweep','ok');
     showDevBox();
@@ -199,10 +233,11 @@ async function doConnect(){
     log('GATT connected: '+(device.name||device.id),'rx');
   }catch(e){
     connected=false;
-    setConnStatus('Connect failed: '+e.message,'err');
+    const msg=formatError(e);
+    setConnStatus('Connect failed: '+msg,'err');
     $('start').disabled=true; $('disconnect').disabled=true;
     $('scan').disabled=false;
-    log('GATT connect failed: '+e.message,'er');
+    log('GATT connect failed: '+msg,'er');
   }
 }
 
@@ -243,7 +278,7 @@ window.addEventListener('load',async()=>{
         await doConnect();
       }
     }
-  }catch(e){}
+  }catch(e){ log('silent-reconnect check skipped: '+formatError(e),'pr'); }
 });
 
 $('scan').onclick=doScan;
@@ -261,7 +296,7 @@ async function run(){
   try{
     // gather services / characteristics from the ALREADY-CONNECTED receiver
     setStatus('Scanning services…','busy'); log('using connected receiver '+(device.name||device.id));
-    let services=[]; try{ services=await server.getPrimaryServices(); }catch(e){ log('svc scan: '+e.message,'er'); }
+    let services=[]; try{ services=await server.getPrimaryServices(); }catch(e){ log('svc scan: '+formatError(e),'er'); }
     if(!services.length){ finish('No matching services — device likely uses a custom 128-bit UUID. Capture with an Android HCI snoop log instead.','err'); return; }
 
     const writables=[]; const notifies=[];
@@ -279,7 +314,7 @@ async function run(){
       try{ await c.startNotifications();
         c.addEventListener('characteristicvaluechanged',e=>{ const hx=dv2hex(e.target.value); lastNotify={uuid:c.uuid,hex:hx,t:Date.now()}; log('RX '+shortUuid(c.uuid)+' → '+hx,'rx'); });
         log('subscribed '+shortUuid(c.uuid),'rx');
-      }catch(e){ log('subscribe fail '+shortUuid(c.uuid)+': '+e.message,'er'); }
+      }catch(e){ log('subscribe fail '+shortUuid(c.uuid)+': '+formatError(e),'er'); }
     }
 
     if(!writables.length){ finish('No writable characteristics found. Capture the app with an HCI snoop log.','err'); return; }
@@ -301,7 +336,7 @@ async function run(){
             if(w.c.properties.writeWithoutResponse && !w.c.properties.write) await w.c.writeValueWithoutResponse(bytes);
             else await w.c.writeValue(bytes);
             log('TX '+shortUuid(w.c.uuid)+' ← '+p.hex+' ('+p.label+')','tx');
-          }catch(e){ writeOk=false; errMsg=e.message; log('write err: '+e.message,'er'); }
+          }catch(e){ writeOk=false; errMsg=formatError(e); log('write err: '+errMsg,'er'); }
 
           // give the device a moment to respond on a notify channel
           await sleep(900);
@@ -330,7 +365,7 @@ async function run(){
       if(aborted) break;
     }
     finish(aborted?'Stopped.':'Sweep complete — no confirmed command. Try capturing the original app (HCI snoop) so we can see the exact bytes + any pairing handshake.', aborted?'':'err');
-  }catch(e){ finish('Error: '+e.message,'err'); }
+  }catch(e){ finish('Error: '+formatError(e),'err'); }
 }
 
 function confirmGate(w,p,responded,writeErr,respHex){
