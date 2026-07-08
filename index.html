@@ -79,6 +79,13 @@
 
   <div class="winner" id="winner"></div>
 
+  <div class="panel" id="savedPanel" style="display:none">
+    <h2>Saved commands <span id="savedCount" style="color:var(--live)"></span></h2>
+    <div id="savedWrap"></div>
+    <div class="row" style="margin-top:8px"><button id="clearSaved">Clear saved</button></div>
+    <div class="hint" style="margin-top:6px">Saved automatically on every confirmed hit and kept on this device — paste into Bluefy's GATT write. You never have to note it down.</div>
+  </div>
+
   <div class="panel">
     <h2>1 · Connect</h2>
     <div class="row" style="margin-bottom:10px">
@@ -448,7 +455,7 @@ async function run(){
 
           const answer = await confirmGate(w, p, responded, writeOk?null:errMsg, responded?lastNotify.hex:null);
 
-          const rec={ t:new Date().toISOString(), service:shortUuid(w.svc), characteristic:shortUuid(w.c.uuid),
+          const rec={ t:new Date().toISOString(), service:shortUuid(w.svc), fullService:w.svc, characteristic:shortUuid(w.c.uuid),
             fullChar:w.c.uuid, payload:p.label, hex:p.hex, write:writeOk?'ok':('err: '+errMsg),
             notifyResponse:responded?lastNotify.hex:'', confirmed:answer==='yes'?'YES':'no' };
           results.push(rec); renderResults();
@@ -490,8 +497,59 @@ function declareWinner(rec){
   const el=$('winner'); el.classList.add('show');
   el.innerHTML=`<b>✓ Command found</b><br>Characteristic <b>${rec.characteristic}</b><br>Payload <b>${rec.payload}</b> = <b>0x${rec.hex}</b>`+
     (rec.notifyResponse?`<br>Status echo: ${rec.notifyResponse}`:'');
+  saveCommand(rec);   // persist to localStorage so it survives reloads — no noting down
   autoSave();
 }
+
+// ---- persistent saved commands (localStorage) — a confirmed command is never lost ----
+const SAVE_KEY='soundkit_saved_commands_v1';
+function loadSaved(){ try{ return JSON.parse(localStorage.getItem(SAVE_KEY)||'[]'); }catch(e){ return []; } }
+function saveCommand(rec){
+  const list=loadSaved();
+  const key=(rec.fullService||rec.service)+'|'+(rec.fullChar||rec.characteristic)+'|'+rec.hex;
+  if(list.some(x=>x.key===key)){ renderSaved(); return; }   // dedupe
+  list.push({ key, device:device?(device.name||device.id):'', when:new Date().toISOString(),
+    service:rec.service, fullService:rec.fullService||'', characteristic:rec.characteristic, fullChar:rec.fullChar||'',
+    payload:rec.payload, hex:rec.hex, notifyResponse:rec.notifyResponse||'' });
+  try{ localStorage.setItem(SAVE_KEY, JSON.stringify(list)); log('command saved on this device — no need to note it down','rx'); }
+  catch(e){ log('could not persist to localStorage: '+formatError(e).pretty,'er'); }
+  renderSaved();
+}
+function copyText(t){ try{ if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(t); }catch(e){} }
+function renderSaved(){
+  const list=loadSaved(), p=$('savedPanel'), w=$('savedWrap');
+  if(!p) return;
+  if(!list.length){ p.style.display='none'; return; }
+  p.style.display='block'; $('savedCount').textContent='('+list.length+')';
+  w.innerHTML=list.map((c,i)=>`<div style="border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px">
+    <div style="color:var(--live);font-weight:600;margin-bottom:4px">${c.payload} = 0x${c.hex}</div>
+    <div style="font-size:11px;color:var(--dim);word-break:break-all">service ${c.fullService||c.service}<br>char ${c.fullChar||c.characteristic}${c.notifyResponse?'<br>echo '+c.notifyResponse:''}</div>
+    <div class="row" style="margin-top:6px">
+      <button class="primary" data-send="${i}">▶ Send</button>
+      <button data-copy="${c.hex}">Copy bytes</button>
+      <button data-copy="${c.fullChar||c.characteristic}">Copy char UUID</button>
+    </div></div>`).join('');
+  w.querySelectorAll('button[data-copy]').forEach(b=>b.onclick=()=>{ copyText(b.dataset.copy); const o=b.textContent; b.textContent='Copied ✓'; setTimeout(()=>b.textContent=o,1200); });
+  w.querySelectorAll('button[data-send]').forEach(b=>b.onclick=()=>sendSaved(list[+b.dataset.send]));
+}
+
+// re-fire a saved command — turns THIS tool (running in Bluefy) into the remote.
+async function sendSaved(c){
+  try{
+    if(!device){ setStatus('Press Scan and connect to the receiver first, then Send.','err'); log('send: no device — Scan+connect first','er'); return; }
+    if(!device.gatt.connected){ setStatus('Reconnecting…','busy'); server=await device.gatt.connect(); }
+    setStatus('Sending '+c.payload+'…','busy');
+    const svc=await server.getPrimaryService(c.fullService||c.service);
+    const ch=await svc.getCharacteristic(c.fullChar||c.characteristic);
+    const bytes=hex2bytes(c.hex);
+    if(ch.properties.writeWithoutResponse && !ch.properties.write) await ch.writeValueWithoutResponse(bytes);
+    else await ch.writeValue(bytes);
+    setStatus('Sent '+c.payload+' (0x'+c.hex+')','ok');
+    log('TX '+shortUuid(c.fullChar||c.characteristic)+' ← '+c.hex+' ('+c.payload+')','tx');
+  }catch(e){ const m=formatError(e).pretty; setStatus('Send failed: '+m,'err'); log('send err: '+m,'er'); }
+}
+$('clearSaved').onclick=()=>{ if(confirm('Clear all saved commands on this device?')){ localStorage.removeItem(SAVE_KEY); renderSaved(); } };
+window.addEventListener('load', renderSaved);
 
 function renderResults(){
   const w=$('resultsWrap');
