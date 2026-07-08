@@ -136,6 +136,13 @@
 const CANDIDATES=[];
 for(let i=0xFF00;i<=0xFFFF;i++) CANDIDATES.push(i);
 CANDIDATES.push('6e400001-b5a3-f393-e0a9-e50e24dcca9e',0x1800,0x1801,0x180a,0x180f);
+// A trimmed fallback list — some thin WebView Bluetooth bridges (observed: Bluefy)
+// have been seen to reject requestDevice() with an opaque, undocumented internal
+// error when optionalServices is very large (our full vendor sweep is ~261 UUIDs).
+// This isn't documented anywhere, so we treat it as a testable hypothesis rather than
+// a fact: if the full list fails, we automatically retry once with a much smaller
+// list and report explicitly whether that changed the outcome.
+const CANDIDATES_MINIMAL=['6e400001-b5a3-f393-e0a9-e50e24dcca9e',0x1800,0x1801,0x180a,0x180f,0xFF00,0xFFE0,0xFFE1];
 
 // ---- candidate payloads: four-state hypothesis + ASCII variants ----
 const PAYLOADS=[
@@ -227,8 +234,9 @@ async function checkAdapterAvailability(){
 }
 
 // ---- STEP 1: SCAN — open the native device picker, let the operator pick the receiver ----
-async function doScan(retryCount){
-  retryCount = retryCount || 0;
+async function doScan(retryCount, useMinimalServices){
+  retryCount = (typeof retryCount==='number' && !isNaN(retryCount)) ? retryCount : 0;
+  useMinimalServices = !!useMinimalServices;
   if(!navigator.bluetooth){
     setConnStatus('Web Bluetooth is not available in this browser/context (needs HTTPS + Chrome/Bluefy).','err');
     log('scan aborted: navigator.bluetooth is undefined — wrong browser or not a secure context','er');
@@ -237,7 +245,9 @@ async function doScan(retryCount){
   try{
     setConnStatus('Opening device picker…','busy');
     $('scan').disabled=true;
-    const picked=await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices:CANDIDATES});
+    const serviceList = useMinimalServices ? CANDIDATES_MINIMAL : CANDIDATES;
+    log('requestDevice with '+(useMinimalServices?'MINIMAL':'FULL')+' optionalServices list ('+serviceList.length+' entries)','pr');
+    const picked=await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices:serviceList});
     if(!picked){
       setConnStatus('No device returned by picker.','err');
       log('requestDevice resolved with no device','er');
@@ -258,24 +268,32 @@ async function doScan(retryCount){
     // IMPORTANT: only match the adapter-unavailable text specifically — NotFoundError is
     // also what Chrome throws when the user deliberately cancels the picker dialog, and
     // we must never auto-reopen the picker in that case.
-    // Bluefy's bare numeric codes are undocumented (see formatError/dumpErrorShape) — we
-    // no longer assume what they mean. Retry once in case it's transient, then surface
-    // the raw diagnostic evidence (logged by formatError) instead of guessing further.
+    // Bluefy's bare numeric codes are undocumented (see formatError/dumpErrorShape).
+    // Testable hypothesis: an oversized optionalServices list (261 UUIDs) trips an
+    // internal limit in Bluefy's bridge. On the FIRST failure with an undocumented
+    // code, retry once with a MINIMAL service list and report explicitly whether that
+    // changed the outcome — this converts a guess into an actual A/B test result.
     const looksLikeColdAdapter = /adapter not available/i.test(msg);
     const looksLikeUndocumentedCode = /raw numeric code/i.test(msg);
     const userCancelled = /user cancelled/i.test(msg);
-    if((looksLikeColdAdapter || looksLikeUndocumentedCode) && retryCount < 1){
+    if(looksLikeColdAdapter && retryCount < 1){
       setConnStatus('Scan failed — retrying once in 2s in case it was transient…','busy');
       log('scan failed ('+msg+') — auto-retrying once','er');
-      setTimeout(()=>doScan(retryCount+1), 2000);
+      setTimeout(()=>doScan(retryCount+1, useMinimalServices), 2000);
+      return;
+    }
+    if(looksLikeUndocumentedCode && !useMinimalServices){
+      setConnStatus('Scan failed with optionalServices=FULL (261 entries) — retrying with a MINIMAL list to test if list size is the cause…','busy');
+      log('scan failed with FULL service list ('+msg+') — retrying with MINIMAL list as a diagnostic test','er');
+      setTimeout(()=>doScan(retryCount, true), 1500);
       return;
     }
     if(looksLikeColdAdapter){
       setConnStatus('Bluetooth adapter still not available after retry. On iPhone/Bluefy: confirm iOS Settings → Bluetooth is ON, Settings → Bluefy → Bluetooth is allowed, then fully quit and reopen Bluefy (not just reload the page) and try again.','err');
       log('scan cancelled/failed after '+(retryCount+1)+' attempts: '+msg,'er');
-    }else if(looksLikeUndocumentedCode){
-      setConnStatus("Scan failed with an undocumented Bluefy error code after retry. See the \"raw error shape\" line in the Log panel below and share it — that has the real diagnostic detail this message alone can't give you.",'err');
-      log('scan cancelled/failed after '+(retryCount+1)+' attempts, undocumented code: '+msg,'er');
+    }else if(looksLikeUndocumentedCode && useMinimalServices){
+      setConnStatus("Scan STILL fails with a MINIMAL optionalServices list too — so list size is ruled out as the cause. This is a genuine undocumented Bluefy bridge error. See the \"raw error shape\" line in the Log panel and share it along with your Bluefy app version.",'err');
+      log('scan failed even with MINIMAL service list — list-size hypothesis disproven. Raw code: '+msg,'er');
     }else if(userCancelled){
       setConnStatus('Picker closed — no device selected. Press Scan to try again.','');
       log('picker cancelled by user','pr');
@@ -359,7 +377,7 @@ window.addEventListener('load',async()=>{
   }catch(e){ log('silent-reconnect check skipped: '+formatError(e),'pr'); }
 });
 
-$('scan').onclick=doScan;
+$('scan').onclick=()=>doScan();
 $('start').onclick=run;
 $('stop').onclick=()=>{ aborted=true; if(pendingResolve){ pendingResolve('abort'); } setStatus('Stopping…','busy'); };
 
