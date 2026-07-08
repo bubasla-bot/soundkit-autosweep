@@ -66,6 +66,9 @@
   .winner{background:#0d2417; border:1px solid #1c4a30; border-radius:8px; padding:12px; margin-bottom:14px; display:none}
   .winner.show{display:block}
   .winner b{color:var(--live)}
+  .devbox{background:var(--panel2); border:1px solid var(--line); border-radius:7px; padding:8px 10px; margin-top:10px; font-size:12px; display:none}
+  .devbox.show{display:block}
+  .devbox b{color:var(--live)}
 </style>
 </head>
 <body>
@@ -77,12 +80,22 @@
   <div class="winner" id="winner"></div>
 
   <div class="panel">
-    <h2>Control</h2>
+    <h2>1 · Connect</h2>
     <div class="row" style="margin-bottom:10px">
-      <button class="primary" id="start">Start auto-sweep</button>
+      <button class="primary" id="scan">Scan for receiver</button>
+      <button id="disconnect" disabled>Disconnect</button>
+    </div>
+    <div class="status-line"><span class="dot" id="connDot"></span><span id="connStatusText">No device selected. Power on the receiver, then Scan.</span></div>
+    <div class="devbox" id="devbox"></div>
+  </div>
+
+  <div class="panel">
+    <h2>2 · Sweep</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button class="primary" id="start" disabled>Start auto-sweep</button>
       <button id="stop" disabled>Stop</button>
     </div>
-    <div class="status-line"><span class="dot" id="dot"></span><span id="statusText">Idle. Power the receiver, then Start.</span></div>
+    <div class="status-line"><span class="dot" id="dot"></span><span id="statusText">Idle. Connect to the receiver first.</span></div>
     <div class="progress"><div id="bar"></div></div>
   </div>
 
@@ -138,6 +151,7 @@ const $=id=>document.getElementById(id);
 const enc=v=>v.toString(16).padStart(2,'0');
 let device=null, server=null, aborted=false, pendingResolve=null, skipChar=false;
 let results=[], lastNotify=null, winner=null;
+let connected=false;
 
 function shortUuid(u){ const m=/0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb/.exec(u); return m?('0x'+m[1].toUpperCase()):u; }
 function log(msg,cls=''){ const el=$('log'); const t=new Date().toLocaleTimeString('en-GB',{hour12:false});
@@ -145,35 +159,108 @@ function log(msg,cls=''){ const el=$('log'); const t=new Date().toLocaleTimeStri
 function dv2hex(dv){ let o=[]; for(let i=0;i<dv.byteLength;i++) o.push(enc(dv.getUint8(i))); return o.join(' '); }
 function hex2bytes(h){ const a=new Uint8Array(h.length/2); for(let i=0;i<a.length;i++) a[i]=parseInt(h.substr(i*2,2),16); return a; }
 function setStatus(txt,state){ $('statusText').textContent=txt; const d=$('dot'); d.className='dot'+(state?' '+state:''); }
+function setConnStatus(txt,state){ $('connStatusText').textContent=txt; const d=$('connDot'); d.className='dot'+(state?' '+state:''); }
 
 (function(){ const w=$('support');
-  if(navigator.bluetooth){ w.textContent='Web Bluetooth available. If Start does nothing, this is running inside a sandbox — open the file on HTTPS (GitHub Pages) in Chrome/Android or desktop. iPhone: use the Bluefy browser.'; }
-  else{ w.textContent='Web Bluetooth NOT available. Use Chrome on Android/desktop, or Bluefy on iOS. Safari and iOS Chrome will not work.'; $('start').disabled=true; }
+  if(navigator.bluetooth){ w.textContent='Web Bluetooth available. If Scan does nothing, this is running inside a sandbox — open the file on HTTPS (GitHub Pages) in Chrome/Android or desktop. iPhone: use the Bluefy browser.'; }
+  else{ w.textContent='Web Bluetooth NOT available. Use Chrome on Android/desktop, or Bluefy on iOS. Safari and iOS Chrome will not work.'; $('scan').disabled=true; }
 })();
 
-// try silent reconnect to a previously-approved device (no picker)
+// ---- STEP 1: SCAN — open the native device picker, let the operator pick the receiver ----
+async function doScan(){
+  try{
+    setConnStatus('Opening device picker…','busy');
+    $('scan').disabled=true;
+    const picked=await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices:CANDIDATES});
+    device=picked;
+    device.addEventListener('gattserverdisconnected',onDisconnected);
+    log('selected device: '+(device.name||device.id),'pr');
+    showDevBox();
+    await doConnect();
+  }catch(e){
+    setConnStatus('Scan cancelled: '+e.message,'err');
+    log('scan cancelled/failed: '+e.message,'er');
+    $('scan').disabled=false;
+  }
+}
+
+// ---- STEP 2: CONNECT — establish the GATT link to the picked/known device ----
+async function doConnect(){
+  try{
+    setConnStatus('Connecting to '+(device.name||'device')+'…','busy');
+    server=await device.gatt.connect();
+    connected=true;
+    setConnStatus('Connected — ready to sweep','ok');
+    showDevBox();
+    $('scan').disabled=false; $('scan').textContent='Re-scan';
+    $('disconnect').disabled=false;
+    $('start').disabled=false;
+    setStatus('Connected. Ready — press Start auto-sweep.','ok');
+    log('GATT connected: '+(device.name||device.id),'rx');
+  }catch(e){
+    connected=false;
+    setConnStatus('Connect failed: '+e.message,'err');
+    $('start').disabled=true; $('disconnect').disabled=true;
+    $('scan').disabled=false;
+    log('GATT connect failed: '+e.message,'er');
+  }
+}
+
+function showDevBox(){
+  const box=$('devbox'); box.classList.add('show');
+  box.innerHTML='Target receiver: <b>'+(device.name||'(unnamed device)')+'</b><br><span style="color:var(--dim)">id: '+device.id+'</span>';
+}
+
+function onDisconnected(){
+  connected=false;
+  setConnStatus('Disconnected. Re-scan to reconnect.','err');
+  $('start').disabled=true; $('disconnect').disabled=true;
+  log('device disconnected','er');
+  // if a sweep was mid-flight, abort it cleanly rather than hammering a dead link
+  if(!$('stop').disabled){
+    aborted=true;
+    if(pendingResolve){ const r=pendingResolve; pendingResolve=null; r('abort'); }
+    setStatus('Receiver disconnected mid-sweep. Re-scan and reconnect, then Start again.','err');
+  }
+}
+
+$('disconnect').onclick=()=>{
+  try{ if(device && device.gatt.connected) device.gatt.disconnect(); }catch(e){}
+};
+
+// try silent reconnect to a previously-approved device (no picker) on load
 window.addEventListener('load',async()=>{
-  try{ if(navigator.bluetooth.getDevices){ const ds=await navigator.bluetooth.getDevices(); if(ds.length){ device=ds[0]; $('start').textContent='Start auto-sweep ('+(device.name||'known device')+')'; log('found previously approved device: '+(device.name||device.id),'pr'); } } }catch(e){}
+  try{
+    if(navigator.bluetooth && navigator.bluetooth.getDevices){
+      const ds=await navigator.bluetooth.getDevices();
+      if(ds.length){
+        device=ds[0];
+        device.addEventListener('gattserverdisconnected',onDisconnected);
+        log('found previously approved device: '+(device.name||device.id),'pr');
+        showDevBox();
+        setConnStatus('Previously approved device found — connecting…','busy');
+        $('scan').textContent='Re-scan';
+        await doConnect();
+      }
+    }
+  }catch(e){}
 });
 
+$('scan').onclick=doScan;
 $('start').onclick=run;
 $('stop').onclick=()=>{ aborted=true; if(pendingResolve){ pendingResolve('abort'); } setStatus('Stopping…','busy'); };
 
 async function run(){
+  if(!connected || !server){
+    setStatus('Not connected — scan for the receiver first.','err');
+    return;
+  }
   aborted=false; results=[]; winner=null; renderResults();
   $('winner').classList.remove('show');
-  $('start').disabled=true; $('stop').disabled=false;
+  $('start').disabled=true; $('stop').disabled=false; $('scan').disabled=true;
   try{
-    if(!device){
-      setStatus('Waiting for you to pick the device…','busy');
-      device=await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices:CANDIDATES});
-    }
-    device.addEventListener('gattserverdisconnected',()=>{ log('device disconnected','er'); });
-    setStatus('Connecting…','busy'); log('connecting to '+(device.name||device.id));
-    server=await device.gatt.connect();
-
-    // gather services / characteristics
-    setStatus('Scanning services…','busy');
+    // gather services / characteristics from the ALREADY-CONNECTED receiver
+    setStatus('Scanning services…','busy'); log('using connected receiver '+(device.name||device.id));
     let services=[]; try{ services=await server.getPrimaryServices(); }catch(e){ log('svc scan: '+e.message,'er'); }
     if(!services.length){ finish('No matching services — device likely uses a custom 128-bit UUID. Capture with an Android HCI snoop log instead.','err'); return; }
 
@@ -291,7 +378,7 @@ $('exportCsv').onclick=()=>{ const h='characteristic,payload,hex,write,notifyRes
   download('soundkit-sweep.csv',h+rows,'text/csv'); };
 
 function finish(msg,state){ setStatus(msg,state); $('bar').style.width='100%';
-  $('start').disabled=false; $('stop').disabled=true; $('gate').classList.remove('show');
+  $('start').disabled=!connected; $('stop').disabled=true; $('scan').disabled=false; $('gate').classList.remove('show');
   if(results.length){ $('exportJson').disabled=false; $('exportCsv').disabled=false; if(!winner) autoSave(); } }
 function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
 </script>
