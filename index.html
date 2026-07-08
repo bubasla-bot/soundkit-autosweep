@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SoundKit Auto-Sweep</title>
+<style>
+  :root{
+    --bg:#0c0e0f; --panel:#141719; --panel2:#1b1f22; --line:#2a2f33;
+    --ink:#e7ece9; --dim:#7f8a86; --amber:#e0a340; --live:#3ddc84; --hot:#e5533d; --probe:#4a9de0;
+    --mono:"SF Mono",ui-monospace,"Roboto Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--bg); color:var(--ink); font-family:var(--mono); font-size:14px;
+    line-height:1.5; padding:16px; padding-bottom:48px; -webkit-font-smoothing:antialiased}
+  h1{font-size:15px; letter-spacing:.18em; text-transform:uppercase; margin:0 0 2px; font-weight:600}
+  .sub{color:var(--dim); font-size:11px; letter-spacing:.14em; text-transform:uppercase; margin-bottom:16px}
+  .panel{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px}
+  .panel h2{font-size:10px; letter-spacing:.2em; text-transform:uppercase; color:var(--dim); margin:0 0 10px; font-weight:600}
+  button{font-family:var(--mono); font-size:13px; background:var(--panel2); color:var(--ink);
+    border:1px solid var(--line); border-radius:7px; padding:9px 14px; cursor:pointer; letter-spacing:.03em;
+    transition:border-color .15s, background .15s}
+  button:hover:not(:disabled){border-color:var(--amber)}
+  button:disabled{opacity:.4; cursor:not-allowed}
+  button.primary{background:var(--amber); color:#1a1205; border-color:var(--amber); font-weight:600}
+  .row{display:flex; gap:8px; flex-wrap:wrap; align-items:center}
+
+  .status-line{display:flex; align-items:center; gap:12px; font-size:13px}
+  .dot{width:10px; height:10px; border-radius:50%; background:#33393c; flex:0 0 auto}
+  .dot.busy{background:var(--amber); animation:pulse 1s infinite}
+  .dot.ok{background:var(--live)}
+  .dot.err{background:var(--hot)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+  .progress{height:6px; background:#0a0c0d; border:1px solid var(--line); border-radius:4px; overflow:hidden; margin-top:10px}
+  .progress > div{height:100%; width:0; background:var(--amber); transition:width .2s}
+
+  /* confirm gate — the signature moment */
+  #gate{display:none; text-align:center; padding:8px 0}
+  #gate.show{display:block}
+  #gate .now{font-size:11px; letter-spacing:.2em; text-transform:uppercase; color:var(--dim)}
+  #gate .cmd{font-size:22px; letter-spacing:.05em; margin:6px 0 4px}
+  #gate .detail{font-size:11.5px; color:var(--dim); word-break:break-all; margin-bottom:14px}
+  #gate .buttons{display:flex; gap:10px; justify-content:center}
+  #gate button{font-size:16px; padding:14px 0; flex:1; font-weight:600}
+  #yes{background:var(--live); color:#062a15; border-color:var(--live)}
+  #no{background:var(--panel2)}
+  #gate .mini{margin-top:10px; display:flex; gap:8px; justify-content:center}
+  #gate .mini button{font-size:12px; padding:7px 12px; font-weight:400; flex:0 0 auto}
+  .flag{color:var(--probe); font-size:11px; letter-spacing:.1em; text-transform:uppercase; margin-bottom:8px; min-height:14px}
+  .flag.hit{color:var(--live)}
+
+  table{width:100%; border-collapse:collapse; font-size:11.5px}
+  th,td{text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); word-break:break-all}
+  th{color:var(--dim); text-transform:uppercase; letter-spacing:.1em; font-size:9px; font-weight:600}
+  tr.win td{background:#0d2417; color:var(--live)}
+  tr.resp td{color:var(--probe)}
+
+  #log{background:#070809; border:1px solid var(--line); border-radius:8px; padding:11px; height:150px;
+    overflow:auto; font-size:11px; white-space:pre-wrap; word-break:break-all; margin-top:4px}
+  #log .t{color:#4a524e} #log .rx{color:var(--live)} #log .tx{color:var(--amber)} #log .er{color:var(--hot)} #log .pr{color:var(--probe)}
+  .warn{background:#1a1207; border:1px solid #4a3a15; color:var(--amber); border-radius:8px; padding:10px 12px;
+    font-size:11.5px; line-height:1.55; margin-bottom:14px}
+  .hint{color:var(--dim); font-size:11px; line-height:1.6}
+  .winner{background:#0d2417; border:1px solid #1c4a30; border-radius:8px; padding:12px; margin-bottom:14px; display:none}
+  .winner.show{display:block}
+  .winner b{color:var(--live)}
+</style>
+</head>
+<body>
+  <h1>SoundKit Auto-Sweep</h1>
+  <div class="sub">autonomous BLE command finder</div>
+
+  <div class="warn" id="support">Checking Web Bluetooth support…</div>
+
+  <div class="winner" id="winner"></div>
+
+  <div class="panel">
+    <h2>Control</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button class="primary" id="start">Start auto-sweep</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+    <div class="status-line"><span class="dot" id="dot"></span><span id="statusText">Idle. Power the receiver, then Start.</span></div>
+    <div class="progress"><div id="bar"></div></div>
+  </div>
+
+  <div class="panel" id="gatePanel" style="display:none">
+    <h2>Confirm</h2>
+    <div class="flag" id="flag"></div>
+    <div id="gate">
+      <div class="now">Just sent</div>
+      <div class="cmd" id="gateCmd">—</div>
+      <div class="detail" id="gateDetail"></div>
+      <div class="buttons">
+        <button id="yes">YES — it reacted</button>
+        <button id="no">NO — nothing</button>
+      </div>
+      <div class="mini">
+        <button id="repeat">Repeat</button>
+        <button id="skipchar">Skip this characteristic</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Results</h2>
+    <div id="resultsWrap"><div class="hint">No attempts yet.</div></div>
+    <div class="row" style="margin-top:10px">
+      <button id="exportJson" disabled>Export JSON</button>
+      <button id="exportCsv" disabled>Export CSV</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+
+<script>
+// ---- candidate services (Web Bluetooth can't wildcard; probe vendor range + UART) ----
+const CANDIDATES=[];
+for(let i=0xFF00;i<=0xFFFF;i++) CANDIDATES.push(i);
+CANDIDATES.push('6e400001-b5a3-f393-e0a9-e50e24dcca9e',0x1800,0x1801,0x180a,0x180f);
+
+// ---- candidate payloads: four-state hypothesis + ASCII variants ----
+const PAYLOADS=[
+  {label:'0x00', hex:'00'},{label:'0x01', hex:'01'},{label:'0x02', hex:'02'},
+  {label:'0x03', hex:'03'},{label:'0x04', hex:'04'},
+  {label:"'O' (open)", hex:'4f'},{label:"'C' (close)", hex:'43'},
+  {label:"'o'", hex:'6f'},{label:"'c'", hex:'63'},
+  {label:'"open"', hex:'6f70656e'},{label:'"close"', hex:'636c6f7365'},
+  {label:'0x10', hex:'10'},{label:'0x11', hex:'11'},
+];
+
+const $=id=>document.getElementById(id);
+const enc=v=>v.toString(16).padStart(2,'0');
+let device=null, server=null, aborted=false, pendingResolve=null, skipChar=false;
+let results=[], lastNotify=null, winner=null;
+
+function shortUuid(u){ const m=/0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb/.exec(u); return m?('0x'+m[1].toUpperCase()):u; }
+function log(msg,cls=''){ const el=$('log'); const t=new Date().toLocaleTimeString('en-GB',{hour12:false});
+  el.innerHTML+=`<span class="t">${t}</span>  <span class="${cls}">${msg}</span>\n`; el.scrollTop=el.scrollHeight; }
+function dv2hex(dv){ let o=[]; for(let i=0;i<dv.byteLength;i++) o.push(enc(dv.getUint8(i))); return o.join(' '); }
+function hex2bytes(h){ const a=new Uint8Array(h.length/2); for(let i=0;i<a.length;i++) a[i]=parseInt(h.substr(i*2,2),16); return a; }
+function setStatus(txt,state){ $('statusText').textContent=txt; const d=$('dot'); d.className='dot'+(state?' '+state:''); }
+
+(function(){ const w=$('support');
+  if(navigator.bluetooth){ w.textContent='Web Bluetooth available. If Start does nothing, this is running inside a sandbox — open the file on HTTPS (GitHub Pages) in Chrome/Android or desktop. iPhone: use the Bluefy browser.'; }
+  else{ w.textContent='Web Bluetooth NOT available. Use Chrome on Android/desktop, or Bluefy on iOS. Safari and iOS Chrome will not work.'; $('start').disabled=true; }
+})();
+
+// try silent reconnect to a previously-approved device (no picker)
+window.addEventListener('load',async()=>{
+  try{ if(navigator.bluetooth.getDevices){ const ds=await navigator.bluetooth.getDevices(); if(ds.length){ device=ds[0]; $('start').textContent='Start auto-sweep ('+(device.name||'known device')+')'; log('found previously approved device: '+(device.name||device.id),'pr'); } } }catch(e){}
+});
+
+$('start').onclick=run;
+$('stop').onclick=()=>{ aborted=true; if(pendingResolve){ pendingResolve('abort'); } setStatus('Stopping…','busy'); };
+
+async function run(){
+  aborted=false; results=[]; winner=null; renderResults();
+  $('winner').classList.remove('show');
+  $('start').disabled=true; $('stop').disabled=false;
+  try{
+    if(!device){
+      setStatus('Waiting for you to pick the device…','busy');
+      device=await navigator.bluetooth.requestDevice({acceptAllDevices:true, optionalServices:CANDIDATES});
+    }
+    device.addEventListener('gattserverdisconnected',()=>{ log('device disconnected','er'); });
+    setStatus('Connecting…','busy'); log('connecting to '+(device.name||device.id));
+    server=await device.gatt.connect();
+
+    // gather services / characteristics
+    setStatus('Scanning services…','busy');
+    let services=[]; try{ services=await server.getPrimaryServices(); }catch(e){ log('svc scan: '+e.message,'er'); }
+    if(!services.length){ finish('No matching services — device likely uses a custom 128-bit UUID. Capture with an Android HCI snoop log instead.','err'); return; }
+
+    const writables=[]; const notifies=[];
+    for(const s of services){
+      let cs=[]; try{ cs=await s.getCharacteristics(); }catch(e){ continue; }
+      for(const c of cs){
+        if(c.properties.write||c.properties.writeWithoutResponse) writables.push({svc:s.uuid,c});
+        if(c.properties.notify||c.properties.indicate) notifies.push(c);
+      }
+    }
+    log(`found ${writables.length} writable, ${notifies.length} notify characteristic(s)`);
+
+    // auto-subscribe every status feed
+    for(const c of notifies){
+      try{ await c.startNotifications();
+        c.addEventListener('characteristicvaluechanged',e=>{ const hx=dv2hex(e.target.value); lastNotify={uuid:c.uuid,hex:hx,t:Date.now()}; log('RX '+shortUuid(c.uuid)+' → '+hx,'rx'); });
+        log('subscribed '+shortUuid(c.uuid),'rx');
+      }catch(e){ log('subscribe fail '+shortUuid(c.uuid)+': '+e.message,'er'); }
+    }
+
+    if(!writables.length){ finish('No writable characteristics found. Capture the app with an HCI snoop log.','err'); return; }
+
+    // ---- the autonomous sweep ----
+    $('gatePanel').style.display='block';
+    const total=writables.length*PAYLOADS.length; let done=0;
+    for(const w of writables){
+      skipChar=false;
+      for(const p of PAYLOADS){
+        if(aborted) break;
+        let redo=true;
+        while(redo && !aborted && !skipChar){
+          redo=false;
+          lastNotify=null;
+          const bytes=hex2bytes(p.hex);
+          let writeOk=true, errMsg='';
+          try{
+            if(w.c.properties.writeWithoutResponse && !w.c.properties.write) await w.c.writeValueWithoutResponse(bytes);
+            else await w.c.writeValue(bytes);
+            log('TX '+shortUuid(w.c.uuid)+' ← '+p.hex+' ('+p.label+')','tx');
+          }catch(e){ writeOk=false; errMsg=e.message; log('write err: '+e.message,'er'); }
+
+          // give the device a moment to respond on a notify channel
+          await sleep(900);
+          const responded = lastNotify && (Date.now()-lastNotify.t < 1500);
+
+          setStatus(`Sweeping — ${done+1}/${total}`,'busy');
+          $('bar').style.width=((done)/total*100)+'%';
+
+          const answer = await confirmGate(w, p, responded, writeOk?null:errMsg, responded?lastNotify.hex:null);
+
+          const rec={ t:new Date().toISOString(), service:shortUuid(w.svc), characteristic:shortUuid(w.c.uuid),
+            fullChar:w.c.uuid, payload:p.label, hex:p.hex, write:writeOk?'ok':('err: '+errMsg),
+            notifyResponse:responded?lastNotify.hex:'', confirmed:answer==='yes'?'YES':'no' };
+          results.push(rec); renderResults();
+
+          if(answer==='abort'){ aborted=true; break; }
+          if(answer==='repeat'){ redo=true; continue; }
+          if(answer==='skip'){ skipChar=true; break; }
+          if(answer==='yes'){
+            winner=rec; declareWinner(rec); finish('Winner confirmed and saved.','ok'); return;
+          }
+        }
+        done++;
+        if(aborted||skipChar) { if(aborted) break; else continue; }
+      }
+      if(aborted) break;
+    }
+    finish(aborted?'Stopped.':'Sweep complete — no confirmed command. Try capturing the original app (HCI snoop) so we can see the exact bytes + any pairing handshake.', aborted?'':'err');
+  }catch(e){ finish('Error: '+e.message,'err'); }
+}
+
+function confirmGate(w,p,responded,writeErr,respHex){
+  return new Promise(res=>{
+    pendingResolve=res;
+    $('gateCmd').textContent=p.label+'  ('+p.hex+')';
+    $('gateDetail').textContent='char '+shortUuid(w.c.uuid)+(writeErr?('  · write error: '+writeErr):'');
+    const flag=$('flag');
+    if(responded){ flag.textContent='⚑ device sent a status response ('+respHex+') — likely hit'; flag.className='flag hit'; }
+    else{ flag.textContent=''; flag.className='flag'; }
+    $('gate').classList.add('show');
+  });
+}
+function resolveGate(v){ $('gate').classList.remove('show'); if(pendingResolve){ const r=pendingResolve; pendingResolve=null; r(v); } }
+$('yes').onclick=()=>resolveGate('yes');
+$('no').onclick=()=>resolveGate('no');
+$('repeat').onclick=()=>resolveGate('repeat');
+$('skipchar').onclick=()=>resolveGate('skip');
+
+function declareWinner(rec){
+  const el=$('winner'); el.classList.add('show');
+  el.innerHTML=`<b>✓ Command found</b><br>Characteristic <b>${rec.characteristic}</b><br>Payload <b>${rec.payload}</b> = <b>0x${rec.hex}</b>`+
+    (rec.notifyResponse?`<br>Status echo: ${rec.notifyResponse}`:'');
+  autoSave();
+}
+
+function renderResults(){
+  const w=$('resultsWrap');
+  if(!results.length){ w.innerHTML='<div class="hint">No attempts yet.</div>'; return; }
+  let rows=results.map(r=>{
+    const cls=r.confirmed==='YES'?'win':(r.notifyResponse?'resp':'');
+    return `<tr class="${cls}"><td>${r.characteristic}</td><td>${r.payload}</td><td>${r.hex}</td><td>${r.write}</td><td>${r.notifyResponse||'—'}</td><td>${r.confirmed}</td></tr>`;
+  }).join('');
+  w.innerHTML=`<table><thead><tr><th>Char</th><th>Payload</th><th>Hex</th><th>Write</th><th>Notify</th><th>OK?</th></tr></thead><tbody>${rows}</tbody></table>`;
+  $('exportJson').disabled=false; $('exportCsv').disabled=false;
+}
+
+function download(name,text,type){ const b=new Blob([text],{type}); const u=URL.createObjectURL(b);
+  const a=document.createElement('a'); a.href=u; a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(u),2000); }
+function payload(){ return { device:device?(device.name||device.id):'', when:new Date().toISOString(), winner, attempts:results }; }
+function autoSave(){ download('soundkit-result-'+Date.now()+'.json', JSON.stringify(payload(),null,2),'application/json'); log('results auto-saved to JSON','pr'); }
+$('exportJson').onclick=()=>download('soundkit-sweep.json', JSON.stringify(payload(),null,2),'application/json');
+$('exportCsv').onclick=()=>{ const h='characteristic,payload,hex,write,notifyResponse,confirmed\n';
+  const rows=results.map(r=>[r.characteristic,r.payload,r.hex,r.write,r.notifyResponse,r.confirmed].map(x=>'"'+(x||'')+'"').join(',')).join('\n');
+  download('soundkit-sweep.csv',h+rows,'text/csv'); };
+
+function finish(msg,state){ setStatus(msg,state); $('bar').style.width='100%';
+  $('start').disabled=false; $('stop').disabled=true; $('gate').classList.remove('show');
+  if(results.length){ $('exportJson').disabled=false; $('exportCsv').disabled=false; if(!winner) autoSave(); } }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+</script>
+</body>
+</html>
